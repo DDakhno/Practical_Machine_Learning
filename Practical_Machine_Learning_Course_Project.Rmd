@@ -1,0 +1,450 @@
+---
+title: "Course Project Machine Learning"
+author: "D.Dakhno"
+date: "July 27, 2016"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE, comment=''}
+knitr::opts_chunk$set(echo = TRUE)
+```
+##Summary
+
+Performance and accuracy of different predicting models were tested on the data coming 
+from the Human Activity Recognition Project. The goal was to predict the outcome (a manner, 
+in which the exercises was done) in twenty cases where it was unknown (original "testing" 
+data set). The original "training" data set has been partitioned into training, testing and 
+validation slices, the original "testing" used only one time for generation of the 
+requested outcome. Six different non-linear predictive models were build using the 
+training data set, parallel processing being used where applicable. After validating 
+on the testing data set, the best by far accuracy was found for Random Forest, Stochastic 
+Gradient Boosting and Quadratic Discriminant Analysis models. Model stacking was done
+at this basis, with the final validation of
+ the models on the validation slice. The winner model has been used to predict the
+ requested array of twenty outcomes. With respect to the reached accuracy level and 
+ it's confidence interval, at least 19 of 20 predicted outcomes are expected to match 
+ with the original ones. 
+
+##Introduction  
+
+Data used in the project were gathered using devices such as Jawbone Up, Nike
+ FuelBand, and Fitbit. Six probands with accelerometers on the belt, forearm, arm,
+ and dumbbell were asked to perform barbell lifts correctly and incorrectly in 5 different
+ ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har
+ (see the section on the Weight Lifting Exercise Dataset).
+
+**The goal of the project is to predict the manner in which they did the exercise.**
+
+This is the "classe" variable in the training set. Other variables can be used as 
+predictors.
+
+##Restrictions and conventions  
+
+With respect to the existing restrictions (max. 2000 words and 4 figures), the main 
+part of the executed source code stays away from the HTML report, though it is available 
+in the Rmarkdown version.
+
+
+##General setup and downloading the data  
+
+Pre-partitioned training and test data were downloaded using following links:  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv  
+
+```{r echo=FALSE , comment=''}
+suppressMessages(library(caret))
+suppressMessages(library(data.table))
+suppressMessages(library(parallel))
+suppressMessages(library(doParallel))
+suppressMessages(library(dplyr))
+suppressMessages(library(stringi))
+##Uncomment the following lines if download needed
+#download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile="pml-training.csv")
+#download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile="pml-testing.csv")
+training <- read.csv(file = "pml-training.csv", quote = c("\""), na.strings = c("","NA","#DIV/0!"))
+testing  <- read.csv(file = "pml-testing.csv",  quote = c("\""),  na.strings = c("","NA","#DIV/0!"))
+```
+
+##Explorative data analysis
+
+```{r collapse=TRUE, comment=''}
+dim(training)
+```
+
+One issue to deal with is, that the outcomes in the 
+training dataset is apparently ordered by variable *classe*:
+
+```{r collapse=TRUE, comment=''}
+range(which(training$classe=="A", arr.ind = T))
+range(which(training$classe=="B", arr.ind = T))
+```
+...so we should riffle the cards explicitly as a precaution.
+
+```{r  comment='', collapse=T}
+set.seed(654321)
+spatt <- sample(1:dim(training)[1],replace = FALSE)
+training <- training[spatt,]
+num_na <- sapply(training,function(x) sum(is.na(x))) 
+num_na_range <- range(num_na[num_na > 0])
+```
+
+Variable "classe" is outcome, whereas user_name could is possible predictor (individual 
+traits could contribute to the outcome). Other variables are the measurements from
+ the fitness gadgets. The number of the measured variables as possible 
+predictors is `r dim(training)[2] - 5` (though, timestamps will be ignored), but
+`r sum(num_na > 1900)` of them has from `r num_na_range[1]` to `r num_na_range[2]`
+missing values, out of `r dim(training)[1]` possible. There is no reliable imputing
+method available, so we exclude them from the further analysis and validation.
+
+```{r comment='', collapse=T}
+set.seed(654321)
+spatt <- sample(1:dim(training)[1],replace = FALSE)
+num_na <- sapply(training,function(x) sum(is.na(x))) 
+num_na_range <- range(num_na[num_na > 0])
+training <- training[,num_na < num_na_range[1]]
+ultima_ratio <- testing[,num_na < num_na_range[1]]
+```
+
+####Principal component analysis of the training data set
+
+Performed for the data exploration, PCA shows the first seven principal components
+ explaining about 90% of the total variance in dataset. PCA could bring the speed up
+ of two times for the training function. According to the preliminary benchmarks,
+ a common controversy execution performance vs. prediction accuracy has been shown.
+```{r echo=FALSE}
+training <- training[,-c(1,3:5)]
+ultima_ratio <- ultima_ratio[, -c(1,3:5)]
+prcc <- prcomp(training[,sapply(training,class) != "factor"])
+dn <- dimnames(prcc$x)[[2]]
+v <- (1:length(dn))%%5 == 0
+dn[v==FALSE] <- ""
+totalvar <- sum(prcc$sd^2)
+yy <- cumsum(prcc$sd^2*100)/totalvar
+qplot(x = 1:length(dn),y = yy , main = "Principal components, cumulated variancy") + geom_point(size=2 , col= (yy < 90)+2)+ xlab(label = "Principal component, #" ) + ylab("Cumulated variancy,% of total") + ylim(2,100)
+```
+  
+##Prediction study design
+
+The only usage of the provided "testing" dataset is prediction of 20 different 
+test cases to be submitted to the Project Prediction Quiz (*ultima raio* dataset). The training 
+dataset is big enough to split it into training, testing and validation parts 
+(proportion 60/20/20%).   
+* Building of then candidate models and in sample error/accuracy assessment will be 
+done on the new training dataset.  
+* Out of sample accuracy of the built models will be estimated with testing dataset. We 
+can build here stacked models as well.  
+* The final model evaluation and selection of the winner will be done with validation 
+dataset.
+
+
+```{r echo = FALSE, comment=''}
+inTrain <- createDataPartition(training$classe, p= .6, list = FALSE)
+training <- training[inTrain,]
+theRest <- training[-inTrain,]
+inTrain <- createDataPartition(theRest$classe, p= .5, list = FALSE)
+testing <- theRest[inTrain,]
+validation <- theRest[-inTrain,]
+
+```
+
+
+```{r collapse=TRUE, comment=''}
+dim(training)
+dim(testing)
+dim(validation)
+table(sapply(training,class))
+```
+
+
+There are five possible levels of outcome.   
+```{r collapse=TRUE, comment=''}
+table(training$classe)
+```
+  
+##Building models
+
+Linear and generalized linear regression models in default setup doesn't really work
+with the factor outcome, so we will use different, non-linear models for prediction.
+With respect to the discrete nature of the outcome, assessment of the in sample error 
+is performed using accuracy of prediction against the training set (manual control 
+with *confusionTable()*) and reported by model itself (as *max(modFit\\$results\\$Accuracy)*).  
+Parallel processing is used for the sake of performance, allowing to test more model types 
+and methods.
+
+```{r Building models, echo=FALSE, warning=FALSE, collapse=TRUE, comment=''}
+
+modFitFunc <- function(trdata,mtd) {
+
+        fitControl <- trainControl(method = "cv",  number=5)
+        set.seed(7777)
+        verbose = ifelse(mtd %in% c("gbm","rpart"), FALSE, TRUE)
+        if (mtd != "rpart")
+                modFit <- suppressMessages(train( form = classe ~ ., data = trdata, method = mtd, trControl = fitControl, verbose = verbose))
+        else
+                modFit <- suppressMessages(train( form = classe ~ ., data = trdata, method = mtd, trControl = fitControl))
+        
+        modFit
+}
+
+modelList <- list()
+
+##Improving performance through parallel processing
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+
+mthds <- c("rpart","gbm","nb","rf","lda","qda")
+meth_names <- c("Recursive Partitioning", "Generalized Boosted Regression", "Naive Bayes", "Random Forest", "Linear Discriminant Analysis","Quadratic Discriminant Analysis")
+names(meth_names) <- mthds
+
+for (mtd in mthds) {  
+        set.seed(4444444)
+        modelList[[mtd]] <- modFitFunc(training,mtd) 
+}
+
+results_model <- data.table(matrix(ncol=7))
+colnames(results_model) <- c("Library","Model","Method","Metric","trContrMeth.","number","repeats")
+for (model in modelList) {
+        libr <- ""
+        for (lb in model$modelInfo$library) libr <- paste(libr,lb)
+        libr <- stri_replace_all(str = stri_trim(libr),replacement = ",",regex = " ")
+        results_model <- rbind(results_model,list(model$modelInfo$library[1],model$modelType, model$method, model$metric, model$control$method,model$control$number,model$control$repeats))
+}
+results_model<- results_model[-1,]
+print(results_model)
+
+```
+  
+###Assessment of the in sample accuracy
+
+Assessment of the in sample accuracy will be performed using the function *confusionMatrix()*,
+ as well as the requested through the model fit itself.
+
+```{r Assessment of the in sample accuracy, echo=FALSE , warning=FALSE, comment=''}
+results_perf <- data.table(matrix(ncol=7))
+colnames(results_perf) <- c("Count","Library","Method","Metric","Accuracy,model","Accuracy,cT","Exec.time,sec.")
+for (model in modelList) {
+        set.seed(4444444)
+        predTrain <- predict(model)
+        cnt <- dim(training)[1]
+        am <- confusionMatrix(predTrain,training$classe[1:length(predTrain)])
+        results_perf <- rbind(results_perf,list(cnt,model$modelInfo$library[1],model$method, model$metric, round(max(model$results$Accuracy),4), am$overall[1] ,round(model$times$everything[3],3)))
+}
+
+results_perf <- results_perf[-1,]
+results_perf_arr <- arrange(results_perf,`Accuracy,cT`)
+print(results_perf_arr)
+top_3_acc_in <- results_perf_arr$`Accuracy,cT`[(dim(results_perf)[1]-2):dim(results_perf)[1]]
+top_3_meth_in <- results_perf_arr$Method[(dim(results_perf)[1]-2):dim(results_perf)[1]]
+```
+
+At this moment, the top-3 leading methods are `r meth_names[top_3_meth_in[3]]`, `r meth_names[top_3_meth_in[2]]`
+and `r meth_names[top_3_meth_in[1]]`, with accuracy of respective `r top_3_acc_in[3]`,
+`r top_3_acc_in[2]` and `r top_3_acc_in[1]`. Fast ideal accuracy should not be overestimated
+ thinking on possible overfitting.
+
+  
+##Validating models on the testing dataset
+  
+###Assessment of out of sample accuracy
+
+Assessment is done on the testing data set.
+
+```{r Assessment of out of sample accuracy, echo=FALSE, warning=FALSE, comment=''}
+results_testing <- data.table(matrix(ncol=6))
+prdctTest <- list()
+colnames(results_testing) <- c("Count","Method","Accuracy","AccuracyLower","AccuracyUpper","AccuracyPValue")
+for (model in modelList) {
+        set.seed(4444444)
+        predTesting <- predict(model,newdata = testing)
+        prdctTest[[model$method]] <- predTesting
+        cnt <- dim(testing)[1]
+        ctres <- confusionMatrix(testing$classe,predTesting)
+        #print(paste(cnt,model$method,ctres$overall[1],ctres$overall[3],ctres$overall[4],ctres$overall[6]))
+        results_testing <- rbind(results_testing,list(cnt,model$method,ctres$overall[1],ctres$overall[3],ctres$overall[4],ctres$overall[6]))
+}
+results_testing <- results_testing[-1,]
+results_testing_arr <- arrange(results_testing,Accuracy)
+print(results_testing_arr)
+top_3_acc_out <- results_testing_arr$Accuracy[(dim(results_testing_arr)[1]-2):dim(results_testing_arr)[1]]
+top_3_meth_out <- results_testing_arr$Method[(dim(results_testing_arr)[1]-2):dim(results_testing_arr)[1]]
+
+conclusion <- " as expected some lower, than "
+if (top_3_acc_out[3] > top_3_acc_in[3])
+        conclusion <- " some surprisingly  higher, than "
+if (top_3_acc_out[3] == top_3_acc_in[3]) conclusion <- " the same, as "
+```
+```{r collapse=TRUE}
+gc()
+```
+
+After validation at the testing dataset, the top-3 methods are `r meth_names[top_3_meth_out[1]]`,
+`r meth_names[top_3_meth_out[2]]` and `r meth_names[top_3_meth_out[1]]`, with accuracy
+of respective `r top_3_acc_out[3]`, `r top_3_acc_out[2]` and `r top_3_acc_out[1]`.  
+The best *out of sample* accuracy is `r conclusion` the best *in sample* one
+(`r top_3_acc_out[3]` vs. `r top_3_acc_in[3]`).  
+
+The better models offer better accuracy at the price of interpretability and scalability  
+
+```{r echo=FALSE}
+plot(modelList["rf"]$rf$finalModel, main = "Random Forest, finalModel", frame.plot = T)
+```
+  
+..compared to the moderately accurate methods like rpart.  
+
+```{r fig.height=8, echo=FALSE}
+suppressMessages(library(rattle))
+fancyRpartPlot(modelList["rpart"]$rpart$finalModel, main = "Recursive Partitioning, finalModel", sub = "")
+```
+
+  
+###Combining classifiers
+
+It is known, that combining classifiers may improve accuracy. We stack the three most 
+informative predictive methods to prove this,  combining their predicted values and 
+using the the set of the modelling methods, except for both discriminant
+analysis methods (they bring error with the already high colinear stacked primary
+ outcomes),
+
+
+```{r Combining classifiers, echo=FALSE, warning=FALSE, comment=''}
+        
+        combiTesting <- data.frame(classe=as.factor(testing$classe),
+                                   col1=as.factor(prdctTest[[top_3_meth_out[1]]]),
+                                   col2=as.factor(prdctTest[[top_3_meth_out[2]]]),
+                                   col3=as.factor(prdctTest[[top_3_meth_out[3]]])
+                                   )
+        
+        #registerDoParallel(detectCores()-1)
+        
+        for (mtd in mthds[1:(length(mthds)-2)]) {
+                
+                fitControl <- trainControl(method = "cv",  number=5)
+                
+                if (mtd == "rpart") {
+                        modCombi <- train(classe  ~ ., data = combiTesting, method = mtd)
+                }
+                else {
+                        modCombi <- train(classe  ~ ., data = combiTesting, method = mtd, verbose = ifelse(mtd ==  "gbm",FALSE,TRUE))
+                        }
+                
+                modelList[[paste("combi",mtd,sep="-")]] <- modCombi
+                prd <- predict(modCombi)
+                ctres <- confusionMatrix(combiTesting[["classe"]],prd) 
+                results_testing <- rbind(results_testing,list(cnt,paste("combi",mtd,sep="-"),ctres$overall[1],ctres$overall[3],ctres$overall[4],ctres$overall[6]))
+        }
+
+       results_testing_arr <- arrange(results_testing,Accuracy)
+       print(results_testing_arr)
+       top_3_meth_combi <- results_testing_arr$Method[results_testing_arr$Method %like% "combi"]
+       top_3_meth_combi <- top_3_meth_combi[(length(top_3_meth_combi)-2):length(top_3_meth_combi)]
+       max_acc_combi <- results_testing_arr$Accuracy[dim(results_testing_arr)[1]]
+       conclusion <- "brings not really the accuracy gain"
+       if (max_acc_combi > top_3_acc_out[3]) {
+               conclusion <- "brings the expected accuracy gain"
+       }
+       if (top_3_acc_out[3] == 1) conclusion <- paste(conclusion,", as the best accuracy 
+                                                    of stand-alone prediction is really top-notch")
+```
+```{r collapse=T}
+gc()
+```
+
+The combination of predictors `r conclusion` (accuracy combined `r max_acc_combi`
+vs. `r top_3_acc_out[3]` for `r meth_names[top_3_meth_out[3]]`). The shortlist for
+the final model evaluation and selection of the winner includes three best elementary
+methods, used to build predictors for three best methods for combined data. We give
+ the chance to all of them.
+
+```{r comment='', echo=FALSE}
+shortlist <- c(top_3_meth_out, top_3_meth_combi)
+```
+
+```{r comment='', collapse=T}
+shortlist
+```
+  
+##Final models evaluation and selection of the winner
+
+For this step we are using the validation slice. We use only the original data, stacked
+ outcomes and the already built models from the shortlist.
+
+```{r Final model evaluation, echo=FALSE, warning=FALSE, comment=''}
+        
+        results_validation<- copy(results_testing[0])
+        #Constructing predictions for the combi-models
+        prdctVali <- list()
+        flag = 1
+        for (mdn in shortlist){
+                modFit <- modelList[[mdn]]
+                if (! mdn %like% "combi") {
+                     prd <- predict(modFit, newdata = validation)
+                     prdctVali[[toupper(mdn)]]  <- prd
+                }
+                else {
+                        if (flag) { vld <- data.frame(validation$classe,prdctVali)
+                                        colnames(vld) <- c("classe","col1","col2","col3")
+                                        flag = 0 
+                                }
+                        
+                        prd <- predict(modFit, newdata = vld)
+                }
+                ctres <- confusionMatrix(validation[["classe"]],prd) 
+                results_validation <-   rbind(results_validation,list(cnt,paste(mdn),ctres$overall[1],ctres$overall[3],ctres$overall[4],ctres$overall[6]))
+        }
+
+        print(arrange(results_validation,Accuracy))
+        max_acc_val <- arrange(results_validation,Accuracy)$Accuracy[dim(results_validation)[1]]
+        best_method_val <- arrange(results_validation,Accuracy)$Method[dim(results_validation)[1]]
+        
+        conclusion <- "As expected, the accuracy of the combi models on the validation dataset is a bit lower than 
+on the testing (due to overfitting here)."
+        if (max_acc_val >= max_acc_combi)
+                conclusion <- "Unexpected, the maximal accuracy on the validation data set is not lower, than on testing."
+        if (best_method_val %like% "combi") conclusion <- paste(conclusion,"The winner is a method, based on the combination of the primarly generated outcomes.")
+#gc()
+```
+
+`r conclusion`  
+  
+##Generating the requested output array
+
+```{r echo=FALSE}
+        best_method_name <- best_method_val
+        app <- ""
+        if (best_method_val %like% "combi-") {
+             best_method_name   <- strsplit(best_method_val,"-")[[1]][2]
+             app <- "analizing stack of primary predictors and "
+        }
+        best_method_name <- meth_names[best_method_name]
+           
+```
+
+Following the results of the validation, the method of choice at the final stage is
+ `r best_method_name`, `r app`offering accuracy of `r round(max_acc_val,3)`. It 
+ is used to generate the requested array of twenty outcomes. We secure the result
+ comparing it to that of `r meth_names[top_3_meth_out[3]]`.
+ 
+```{r collapse=TRUE}
+ 
+   modFit <- modelList[[best_method_val]]
+   col1 <- predict(modelList[shortlist[1]],newdata = ultima_ratio)
+   col2 <- predict(modelList[shortlist[2]],newdata = ultima_ratio)
+   col3 <- predict(modelList[shortlist[3]],newdata = ultima_ratio)
+   
+   combiFinal <- data.frame(classe=as.factor(rep(x="UNKNOWN",20)),
+                                   col1=col1,
+                                   col2=col2,
+                                   col2=col2
+                                   )
+   colnames(combiFinal) <- c("classe","col1","col2", "col3")
+   prdCombi <- predict(modFit, combiFinal)
+   modFit <- modelList["rf"]
+   prdRF <- predict(modFit, ultima_ratio)
+   identical(prdCombi,prdRF$rf)
+   #print(prdCombi ;-)
+   stopCluster(cl)
+   
+```
